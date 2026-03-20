@@ -1,0 +1,7 @@
+streamlit==1.42.0
+prophet==1.1.6
+fredapi==0.5.2
+pandas==2.2.3
+numpy==2.2.1
+plotly==5.24.1
+scikit-learn==1.6.0
