@@ -3,9 +3,9 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Setup
-- Primary languages: TypeScript and Python
+- Primary language: Python
 - When encountering dependency/build errors, check version compatibility FIRST before attempting fixes
-- For Python projects, use `pip3` (not `pip`) as pip may not be in PATH
+- Use `pip3` (not `pip`) as pip may not be in PATH
 
 ## Running the App
 
