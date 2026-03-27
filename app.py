@@ -35,19 +35,20 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from utils.backtest import _display_backtest_results, _run_backtest
+from utils.charts import (
+    _build_component_chart,
+    _build_correlation_bar,
+    _build_forecast_chart,
+    _scatter_chart,
+)
+from utils.forecasting import run_forecast
+
 # ---------------------------------------------------------------------------
 # Local imports
 # ---------------------------------------------------------------------------
 from utils.fred_helper import FredHelper
-from utils.forecasting import run_forecast
-from utils.validation import _validate_company_df, _compute_growth_rates
-from utils.charts import (
-    _build_forecast_chart,
-    _build_component_chart,
-    _build_correlation_bar,
-    _scatter_chart,
-)
-from utils.backtest import _run_backtest, _display_backtest_results
+from utils.validation import _compute_growth_rates, _validate_company_df
 
 # ===========================================================================
 # PAGE CONFIG  (must be the very first Streamlit call)
@@ -672,7 +673,7 @@ if backtest_btn:
                         st.info(
                             "**Note (1-Year):** To prevent data leakage, each fold re-selected "
                             "indicators using only pre-cutoff data. The following folds used "
-                            f"different indicators than the research phase:  \n" +
+                            "different indicators than the research phase:  \n" +
                             "  \n".join(differing)
                         )
 
@@ -697,7 +698,7 @@ if backtest_btn:
                         st.info(
                             "**Note (5-Year):** To prevent data leakage, each fold re-selected "
                             "indicators using only pre-cutoff data. The following folds used "
-                            f"different indicators than the research phase:  \n" +
+                            "different indicators than the research phase:  \n" +
                             "  \n".join(differing_5y)
                         )
 

@@ -2,6 +2,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
+
 def _build_forecast_chart(forecast: pd.DataFrame, train_df: pd.DataFrame, growth_rate: float = None) -> go.Figure:
     """Return an interactive Plotly figure with historical data, forecast, and uncertainty bands."""
     fig = go.Figure()

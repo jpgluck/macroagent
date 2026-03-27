@@ -1,5 +1,6 @@
-import numpy as np                                        
+import numpy as np
 import pandas as pd
+
 
 def _mape(actual, predicted):
     return float(np.mean(np.abs((actual - predicted) / actual)) * 100)

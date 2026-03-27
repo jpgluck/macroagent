@@ -1,10 +1,12 @@
 import numpy as np
-import pandas as pd                                              
-import streamlit as st                                    
+import pandas as pd
+import streamlit as st
 from prophet import Prophet
+
+from utils.charts import _build_backtest_chart
 from utils.fred_helper import FredHelper
-from utils.validation import _mape, _mae, _rmse
-from utils.charts import _build_backtest_chart 
+from utils.validation import _mae, _mape, _rmse
+
 
 def _run_backtest(merged, helper, horizon, n_folds, trend_flex, growth_rate_override):
     """Run n_folds expanding-window CV with given horizon.
@@ -292,7 +294,6 @@ def _display_backtest_results(bt, label="1-Year"):
 
     # --- Interpretation ------------------------------------------------------
     macro_vs_naive   = bt["naive_mape"] - bt["macro_mape"]
-    vanilla_vs_naive = bt["naive_mape"] - bt["vanilla_mape"]
     macro_vs_vanilla = bt["vanilla_mape"] - bt["macro_mape"]
 
     insights = []

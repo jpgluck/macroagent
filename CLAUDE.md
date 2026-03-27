@@ -34,10 +34,31 @@ pip3 install -r requirements.txt
 | scikit-learn | 1.7.2 | OLS regression |
 | statsmodels | 0.14.6 | Required by Prophet |
 
-No build step, no tests, no linter configured.
+No build step required. Tests use pytest; lint uses ruff. See `Makefile` for convenience commands.
 
 - Always verify package version compatibility with the runtime (e.g., Python version) before installing or upgrading
 - After any dependency change, run `streamlit run app.py` to verify it works before reporting success
+
+## Testing
+
+```bash
+make test          # run all 133 tests
+make test-fast     # skip slow Prophet training tests
+make lint          # run ruff linter
+```
+
+Tests are organized as:
+- `tests/unit/` — fast, isolated tests with mocked dependencies
+- `tests/integration/` — tests that exercise Prophet training and backtest orchestration
+- `tests/conftest.py` — shared fixtures (DataFrames, mock FRED client, etc.)
+
+## Development Setup
+
+```bash
+pip3 install -r requirements-dev.txt   # includes pytest + ruff
+make lint                               # check code style
+make test                               # run test suite
+```
 
 ## Architecture
 

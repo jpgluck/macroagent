@@ -1,5 +1,6 @@
 import pandas as pd
 from prophet import Prophet
+
 from utils.fred_helper import FredHelper
 
 
