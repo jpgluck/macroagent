@@ -31,10 +31,6 @@ class FredHelper:
     Prophet regressors for forecasting.
     """
 
-    # Kept for backwards compatibility — used by the FRED connection probe
-    GDP_SERIES_ID = "A191RL1Q225SBEA"
-    CPI_SERIES_ID = "CPIAUCSL"
-
     # Full catalogue of candidate indicators
     # Format: name -> (FRED series ID, human label, frequency, transform)
     #   frequency: "quarterly" | "monthly" | "daily"
