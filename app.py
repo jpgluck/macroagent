@@ -1084,6 +1084,158 @@ if st.session_state.get("forecast_df") is not None:
         f"**Scenario used:** {_scenario_str or 'default'}"
     )
 
+    # ===================================================================
+    # Feature G: Marketing Allocation Recommendation (segment mode only)
+    # ===================================================================
+    if _seg_results and _seg_rank:
+        st.header("G · Marketing Allocation Recommendation")
+        st.markdown(
+            "The agent analyzes which market segment has the **strongest macro tailwind** "
+            "under your chosen scenario — i.e., where macro forces are most likely to "
+            "amplify your marketing spend into real demand growth."
+        )
+
+        # Build scoring data for each segment
+        _mkt_scores = []
+        for seg in _seg_rank["segments"]:
+            if seg not in _seg_results:
+                continue
+            seg_res = _seg_results[seg]
+            seg_fc = seg_res["forecast"]
+            seg_train = seg_res["train_df"]
+            seg_ranking = _seg_rank["segment_rankings"][seg]
+
+            # 1. Projected growth rate (forecast 12m vs last 12m historical)
+            last_12m_hist = seg_train.tail(12)["y"].sum()
+            seg_future = seg_fc[seg_fc["ds"] > seg_train["ds"].max()]
+            forecast_12m = seg_future["yhat"].sum() if len(seg_future) > 0 else 0
+            if last_12m_hist > 0:
+                growth_pct = (forecast_12m / last_12m_hist - 1) * 100
+            else:
+                growth_pct = 0.0
+
+            # 2. R² — how macro-driven is this segment?
+            r2 = seg_ranking["r_squared"]
+
+            # 3. Macro tailwind score: for each of this segment's indicators,
+            #    check if the scenario value is pushing demand up or down
+            #    using the OLS coefficients
+            tailwind = 0.0
+            for ind_name in seg_res["sel_names"]:
+                coef = seg_ranking["coefficients"].get(ind_name, 0.0)
+                scenario_val = scenario_values.get(ind_name)
+                default_val = FredHelper.SCENARIO_DEFAULTS.get(ind_name, (0, 0, 0, 0, "", ""))[2]
+                if scenario_val is not None and default_val is not None:
+                    # How far is the scenario from the neutral default?
+                    deviation = scenario_val - default_val
+                    # Positive coef × positive deviation = tailwind
+                    tailwind += coef * deviation
+
+            # 4. Composite score: macro-driven growth potential
+            #    = projected growth weighted by macro explanatory power
+            macro_leverage = growth_pct * r2
+            # Additional credit if scenario actively pushes this segment up
+            if tailwind > 0:
+                macro_leverage += tailwind * r2
+
+            # Net forecast increase in absolute units
+            net_increase = forecast_12m - last_12m_hist
+
+            top_indicator = seg_ranking["selected"][0] if seg_ranking["selected"] else None
+            top_ind_label = top_indicator["label"] if top_indicator else "N/A"
+            top_ind_corr = top_indicator["corr"] if top_indicator else 0.0
+
+            _mkt_scores.append({
+                "segment": seg,
+                "growth_pct": growth_pct,
+                "r_squared": r2,
+                "tailwind": tailwind,
+                "macro_leverage": macro_leverage,
+                "net_increase": net_increase,
+                "forecast_12m": forecast_12m,
+                "last_12m": last_12m_hist,
+                "top_indicator": top_ind_label,
+                "top_corr": top_ind_corr,
+                "sel_names": seg_res["sel_names"],
+            })
+
+        # Sort by macro leverage (highest = best marketing target)
+        _mkt_scores.sort(key=lambda x: x["macro_leverage"], reverse=True)
+
+        if _mkt_scores:
+            best = _mkt_scores[0]
+
+            # --- Primary recommendation ---------------------------------------
+            st.success(
+                f"**Recommended Marketing Focus: {best['segment']}**  \n"
+                f"Under your current macro scenario, **{best['segment']}** has the "
+                f"highest macro-driven growth potential "
+                f"({best['growth_pct']:+.1f}% projected growth, "
+                f"R² = {best['r_squared']:.0%} macro-explained).  \n"
+                f"Primary driver: **{best['top_indicator']}** "
+                f"(r = {best['top_corr']:+.3f})."
+            )
+
+            # --- Why this segment? Detailed reasoning -------------------------
+            best_drivers = ", ".join(
+                FredHelper.INDICATOR_CATALOGUE[n][1].split("(")[0].strip()
+                for n in best["sel_names"]
+                if n in FredHelper.INDICATOR_CATALOGUE
+            )
+            tailwind_dir = "favorable" if best["tailwind"] > 0 else "neutral" if best["tailwind"] == 0 else "headwind"
+            st.info(
+                f"**Why {best['segment']}?**  \n"
+                f"- Macro forces ({best_drivers}) explain **{best['r_squared']:.0%}** "
+                f"of this segment's demand fluctuations  \n"
+                f"- Under your scenario, the macro environment is **{tailwind_dir}** "
+                f"for this segment (tailwind score: {best['tailwind']:+.1f})  \n"
+                f"- Projected net demand increase: **{best['net_increase']:+,.0f} units** "
+                f"over 12 months  \n"
+                f"- Marketing spend here is amplified by macro conditions — "
+                f"you're swimming *with* the current, not against it"
+            )
+
+            # --- Full ranking table -------------------------------------------
+            st.subheader("All Segments — Macro Leverage Ranking")
+            st.caption(
+                "Segments ranked by macro-driven growth potential. "
+                "Higher score = stronger macro tailwind under your scenario = "
+                "better ROI on marketing spend."
+            )
+
+            rank_rows = []
+            for i, s in enumerate(_mkt_scores):
+                emoji = "1" if i == 0 else ("2" if i == 1 else "3")
+                drivers = ", ".join(
+                    FredHelper.INDICATOR_CATALOGUE[n][1].split("(")[0].strip()
+                    for n in s["sel_names"]
+                    if n in FredHelper.INDICATOR_CATALOGUE
+                )
+                rank_rows.append({
+                    "Rank": f"#{i+1}",
+                    "Segment": s["segment"],
+                    "Projected Growth": f"{s['growth_pct']:+.1f}%",
+                    "R² (Macro-Driven)": f"{s['r_squared']:.0%}",
+                    "Scenario Tailwind": f"{s['tailwind']:+.1f}",
+                    "Macro Leverage Score": f"{s['macro_leverage']:.1f}",
+                    "Net 12-Mo Increase": f"{s['net_increase']:+,.0f}",
+                    "Key Drivers": drivers,
+                })
+            st.dataframe(
+                pd.DataFrame(rank_rows), use_container_width=True, hide_index=True
+            )
+
+            # --- Actionable insight for bottom segment -----------------------
+            if len(_mkt_scores) > 1:
+                worst = _mkt_scores[-1]
+                if worst["macro_leverage"] < 0:
+                    st.warning(
+                        f"**Caution — {worst['segment']}:** This segment faces macro "
+                        f"headwinds under your scenario ({worst['growth_pct']:+.1f}% "
+                        f"projected growth). Marketing spend here may yield lower ROI. "
+                        f"Consider reallocating budget toward {best['segment']}."
+                    )
+
     # --- Download button ----------------------------------------------------
     dl_df = future_only[["ds", "yhat", "yhat_lower", "yhat_upper"]].copy()
     dl_cols = {"ds": "Date", "yhat": "Forecast_Demand", "yhat_lower": "Lower_80pct", "yhat_upper": "Upper_80pct"}

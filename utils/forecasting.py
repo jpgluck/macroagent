@@ -16,8 +16,9 @@ def run_forecast(
 
     Returns (forecast_df, model, train_df).
     """
-    # Build training DataFrame
+    # Build training DataFrame, dropping any rows with NaN in regressor columns
     train_df = merged[["ds", "y"] + sel_names].copy()
+    train_df = train_df.dropna(subset=sel_names).reset_index(drop=True)
 
     # Initialise and train Prophet
     model = Prophet(
