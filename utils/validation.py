@@ -61,12 +61,26 @@ def _validate_company_df(df: pd.DataFrame) -> tuple[bool, str, pd.DataFrame | No
     if demand_col is None:
         return False, "Could not find a column containing 'demand' or 'revenue'. Please rename it.", None
 
+    # --- find optional segment column ---------------------------------------
+    segment_col = next(
+        (c for c in df.columns if "segment" in c.lower() or "market" in c.lower()), None
+    )
+
     # --- parse & clean ------------------------------------------------------
     try:
-        df = df[[date_col, demand_col]].copy()
-        df.columns = ["ds", "y"]
+        cols_to_keep = [date_col, demand_col]
+        if segment_col is not None:
+            cols_to_keep.append(segment_col)
+        df = df[cols_to_keep].copy()
+        rename_map = {date_col: "ds", demand_col: "y"}
+        if segment_col is not None:
+            rename_map[segment_col] = "segment"
+        df = df.rename(columns=rename_map)
         df.loc[:, "ds"] = pd.to_datetime(df["ds"].astype(str))
         df.loc[:, "y"] = pd.to_numeric(df["y"], errors="coerce")
+        if "segment" in df.columns:
+            df.loc[:, "segment"] = df["segment"].astype(str).str.strip()
+            df = df[df["segment"].str.len() > 0]
     except Exception as exc:
         return False, f"Error parsing data: {exc}", None
 

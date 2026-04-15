@@ -40,9 +40,11 @@ from utils.charts import (
     _build_component_chart,
     _build_correlation_bar,
     _build_forecast_chart,
+    _build_segment_correlation_chart,
+    _build_segment_forecast_chart,
     _scatter_chart,
 )
-from utils.forecasting import run_forecast
+from utils.forecasting import run_forecast, run_segment_forecast
 
 # ---------------------------------------------------------------------------
 # Local imports
@@ -82,6 +84,11 @@ _STATE_DEFAULTS = {
     "trend_flexibility":   0.05,        # Prophet changepoint_prior_scale
     "backtest_horizon":    "1 Year",    # selected backtest horizon
     "backtest_metrics_5y": None,        # 5-year backtest results
+    "has_segments":        False,       # whether uploaded data has market segments
+    "segment_rankings":    None,        # output of rank_indicators_by_segment()
+    "segment_results":     None,        # per-segment forecast results
+    "segment_models":      None,        # per-segment Prophet models
+    "combined_forecast":   None,        # combined segment forecast df
 }
 for _key, _val in _STATE_DEFAULTS.items():
     if _key not in st.session_state:
@@ -171,7 +178,16 @@ with st.sidebar:
         ok, err_msg, clean_df = _validate_company_df(raw_df)
         if ok:
             st.session_state["company_df"] = clean_df
-            st.success(f"✅ {len(clean_df)} rows loaded successfully.")
+            has_seg = "segment" in clean_df.columns
+            st.session_state["has_segments"] = has_seg
+            if has_seg:
+                segs = clean_df["segment"].unique()
+                st.success(
+                    f"✅ {len(clean_df)} rows loaded across "
+                    f"**{len(segs)} market segments**: {', '.join(sorted(segs))}"
+                )
+            else:
+                st.success(f"✅ {len(clean_df)} rows loaded successfully.")
         else:
             st.error(f"Validation error: {err_msg}")
             st.session_state["company_df"] = None
@@ -275,7 +291,11 @@ with st.sidebar:
     if st.session_state["company_df"] is None:
         st.caption("Upload data first to see growth rate options.")
     else:
-        growth_rates = _compute_growth_rates(st.session_state["company_df"])
+        # For segment data, aggregate to total demand before computing growth rates
+        _gr_df = st.session_state["company_df"]
+        if st.session_state["has_segments"]:
+            _gr_df = _gr_df.groupby("ds", as_index=False)["y"].sum()
+        growth_rates = _compute_growth_rates(_gr_df)
 
         # Build radio options dynamically
         radio_options = []
@@ -383,33 +403,65 @@ if st.session_state["company_df"] is None:
     )
 else:
     df = st.session_state["company_df"]
+    _has_seg = st.session_state["has_segments"]
 
     col1, col2 = st.columns([3, 2])
 
     with col1:
         st.subheader("Data Preview")
-        st.dataframe(df.rename(columns={"ds": "Date", "y": "Demand"}), height=260)
+        rename_map = {"ds": "Date", "y": "Demand"}
+        if _has_seg:
+            rename_map["segment"] = "Market Segment"
+        st.dataframe(df.rename(columns=rename_map), height=260)
 
     with col2:
         st.subheader("Summary Statistics")
-        stats = df["y"].describe()
-        trend_pct = (df["y"].iloc[-1] / df["y"].iloc[0] - 1) * 100
-
-        st.metric("Mean Demand",  f"{stats['mean']:,.1f}")
-        st.metric("Min Demand",   f"{stats['min']:,.1f}")
-        st.metric("Max Demand",   f"{stats['max']:,.1f}")
-        st.metric("Overall Trend",  f"{trend_pct:+.1f}%",
-                  help="% change from first to last data point")
-        st.metric("Data Points",  f"{len(df)}")
+        if _has_seg:
+            # Show per-segment summary
+            for seg in sorted(df["segment"].unique()):
+                seg_data = df[df["segment"] == seg]
+                seg_total = seg_data["y"].sum()
+                seg_mean = seg_data["y"].mean()
+                st.metric(
+                    f"{seg}",
+                    f"Mean: {seg_mean:,.0f}",
+                    f"Total: {seg_total:,.0f}  ·  {len(seg_data)} rows",
+                )
+            total_demand = df.groupby("ds")["y"].sum()
+            st.metric("Total Data Points", f"{len(df)} ({len(df['segment'].unique())} segments)")
+        else:
+            stats = df["y"].describe()
+            trend_pct = (df["y"].iloc[-1] / df["y"].iloc[0] - 1) * 100
+            st.metric("Mean Demand",  f"{stats['mean']:,.1f}")
+            st.metric("Min Demand",   f"{stats['min']:,.1f}")
+            st.metric("Max Demand",   f"{stats['max']:,.1f}")
+            st.metric("Overall Trend",  f"{trend_pct:+.1f}%",
+                      help="% change from first to last data point")
+            st.metric("Data Points",  f"{len(df)}")
 
     # Quick time-series chart of raw demand
-    fig_raw = px.line(
-        df, x="ds", y="y",
-        labels={"ds": "Date", "y": "Demand"},
-        title="Historical Demand Time Series",
-        template="plotly_white",
-    )
-    fig_raw.update_traces(line=dict(color="#1E88E5"))
+    if _has_seg:
+        fig_raw = px.line(
+            df, x="ds", y="y", color="segment",
+            labels={"ds": "Date", "y": "Demand", "segment": "Market Segment"},
+            title="Historical Demand by Market Segment",
+            template="plotly_white",
+        )
+        # Also show total as a dashed line
+        total_ts = df.groupby("ds", as_index=False)["y"].sum()
+        fig_raw.add_scatter(
+            x=total_ts["ds"], y=total_ts["y"],
+            mode="lines", name="Total",
+            line=dict(color="#212121", width=2.5, dash="dash"),
+        )
+    else:
+        fig_raw = px.line(
+            df, x="ds", y="y",
+            labels={"ds": "Date", "y": "Demand"},
+            title="Historical Demand Time Series",
+            template="plotly_white",
+        )
+        fig_raw.update_traces(line=dict(color="#1E88E5"))
     st.plotly_chart(fig_raw, use_container_width=True)
 
 # ---------------------------------------------------------------------------
@@ -428,10 +480,15 @@ research_btn = st.button(
 )
 
 if research_btn:
-    with st.spinner(
+    _has_seg = st.session_state["has_segments"]
+    _spinner_text = (
+        "Agent is scanning 10 Federal Reserve indicators per market segment "
+        "to find which macro forces matter most — this takes ~15 seconds …"
+        if _has_seg else
         "Agent is scanning 10 Federal Reserve indicators to find which macro "
         "forces matter most for your data — this takes ~10 seconds …"
-    ):
+    )
+    with st.spinner(_spinner_text):
         try:
             helper: FredHelper = st.session_state["fred_helper"]
 
@@ -445,15 +502,30 @@ if research_btn:
             )
             st.session_state["merged_df"] = merged
 
-            # Step 3: Rank and select top 3 indicators
-            ranking = helper.rank_indicators(merged, top_n=3)
-            st.session_state["indicator_ranking"]   = ranking
-            st.session_state["selected_indicators"] = ranking["selected_names"]
+            if _has_seg:
+                # Step 3a: Rank per segment
+                seg_rank = helper.rank_indicators_by_segment(merged, top_n=3)
+                st.session_state["segment_rankings"]    = seg_rank
+                st.session_state["selected_indicators"] = seg_rank["all_selected_names"]
+                # Store a combined indicator_ranking for backward compat (use total demand)
+                total_merged = merged.groupby("ds", as_index=False).agg(
+                    {"y": "sum", **{c: "first" for c in merged.columns if c not in ("ds", "y", "segment")}}
+                )
+                ranking = helper.rank_indicators(total_merged, top_n=3)
+                st.session_state["indicator_ranking"] = ranking
+            else:
+                # Step 3b: Rank globally (original behavior)
+                ranking = helper.rank_indicators(merged, top_n=3)
+                st.session_state["indicator_ranking"]   = ranking
+                st.session_state["selected_indicators"] = ranking["selected_names"]
+                st.session_state["segment_rankings"]    = None
 
             # Reset downstream state so stale results don't persist
-            st.session_state["forecast_df"]      = None
-            st.session_state["backtest_metrics"] = None
-            st.session_state["scenario_values"]  = None
+            st.session_state["forecast_df"]        = None
+            st.session_state["combined_forecast"]   = None
+            st.session_state["segment_results"]     = None
+            st.session_state["backtest_metrics"]    = None
+            st.session_state["scenario_values"]     = None
 
         except RuntimeError as exc:
             st.error(str(exc))
@@ -467,107 +539,169 @@ if st.session_state["indicator_ranking"] is not None:
     merged  = st.session_state["merged_df"]
     n_fetched = len(st.session_state.get("all_indicators") or {})
     n_ranked  = len(ranking["all_rankings"])
+    _seg_rank = st.session_state.get("segment_rankings")
 
-    st.success(
-        f"✅ Agent evaluated **{n_fetched} Federal Reserve indicators** and found "
-        f"**{n_ranked}** with sufficient data. "
-        f"The top **{len(ranking['selected'])}** were selected as macro regressors."
-    )
-
-    # --- Agent Selected Indicators -----------------------------------------
-    st.subheader("Agent-Selected Indicators")
-    st.markdown(
-        f"After evaluating {n_ranked} FRED data series, the agent selected the "
-        f"**{len(ranking['selected'])} indicators** with the strongest correlation "
-        f"to your demand growth rate:"
-    )
-
-    sel_cols = st.columns(len(ranking["selected"]))
-    for col, item in zip(sel_cols, ranking["selected"]):
-        col.metric(
-            item["label"],
-            f"{item['corr']:+.3f}",
-            help=f"Pearson r between YoY demand growth and {item['label']}. "
-                 "Computed on detrended data to remove company growth trend.",
+    # ===== SEGMENT-AWARE CORRELATION DISPLAY ================================
+    if _seg_rank is not None:
+        n_all_sel = len(_seg_rank["all_selected_names"])
+        st.success(
+            f"✅ Agent evaluated **{n_fetched} Federal Reserve indicators** across "
+            f"**{len(_seg_rank['segments'])} market segments** and selected "
+            f"**{n_all_sel} unique indicators** as macro regressors."
         )
 
-    r2_pct = ranking["r_squared"] * 100
-    selected_labels = " + ".join(s["label"] for s in ranking["selected"])
-    st.metric(
-        f"Joint R² ({selected_labels} → Demand Growth)",
-        f"{r2_pct:.1f}%",
-        help="% of YoY demand growth variance explained by the selected indicators together.",
-    )
+        # --- Per-Segment Breakdown -------------------------------------------
+        for seg in _seg_rank["segments"]:
+            seg_r = _seg_rank["segment_rankings"][seg]
+            with st.expander(f"**{seg}** — Top {len(seg_r['selected'])} Indicators", expanded=True):
+                if seg_r["selected"]:
+                    seg_cols = st.columns(len(seg_r["selected"]))
+                    for col, item in zip(seg_cols, seg_r["selected"]):
+                        col.metric(
+                            item["label"],
+                            f"r = {item['corr']:+.3f}",
+                        )
+                    r2_pct = seg_r["r_squared"] * 100
+                    st.metric(
+                        f"Joint R² → {seg} Demand Growth",
+                        f"{r2_pct:.1f}%",
+                    )
+                    # Insight per segment
+                    top = seg_r["selected"][0]
+                    direction = "positively" if top["corr"] > 0 else "inversely"
+                    st.caption(
+                        f"**{seg}** demand is most {direction} correlated with "
+                        f"**{top['label']}** (r = {top['corr']:+.3f}). "
+                        f"Selected indicators explain **{r2_pct:.1f}%** of this segment's demand growth variance."
+                    )
 
-    # --- Agent Insight text ------------------------------------------------
-    top = ranking["selected"][0] if ranking["selected"] else None
-    if top:
-        direction = "positively" if top["corr"] > 0 else "inversely"
-        st.info(
-            f"**Agent Insight:** The selected indicators together explain approximately "
-            f"**{r2_pct:.1f}%** of your historical demand *growth rate* fluctuations "
-            f"(after removing your company's underlying trend). "
-            f"The strongest signal is **{top['label']}** (r = {top['corr']:+.3f}) — "
-            f"your demand is {direction} correlated with this indicator."
-        )
-
-    # --- Full ranking table (collapsible) ----------------------------------
-    with st.expander(f"View full ranking — all {n_ranked} evaluated indicators"):
-        selected_names_set = set(ranking["selected_names"])
-        rank_table = pd.DataFrame([
-            {
-                "Rank": i + 1,
-                "Indicator": r["label"],
-                "Pearson r (YoY)": f"{r['corr']:+.4f}",
-                "|r|": f"{abs(r['corr']):.4f}",
-                "Selected": "✅" if r["name"] in selected_names_set else "",
-            }
-            for i, r in enumerate(ranking["all_rankings"])
-        ])
-        st.dataframe(rank_table, use_container_width=True, hide_index=True)
-
-    # --- OLS Regression Weights --------------------------------------------
-    if ranking["coefficients"]:
-        st.subheader("Regression Weights (OLS)")
-        st.caption(
-            "How much does each 1-unit change in a macro indicator shift "
-            "your demand's YoY growth rate (in percentage points)?"
-        )
-        coef_rows = []
-        for item in ranking["selected"]:
-            name = item["name"]
-            coef = ranking["coefficients"].get(name, 0.0)
-            cfg  = FredHelper.SCENARIO_DEFAULTS.get(name, (None, None, None, None, "unit", ""))
-            unit = cfg[4]
-            coef_rows.append({
-                "Indicator": item["label"],
-                f"Coefficient (pp demand growth per 1 {unit} change)": f"{coef:+.4f}",
-                "Interpretation": (
-                    f"1 {unit} {'increase' if coef >= 0 else 'decrease'} in "
-                    f"{item['label']} → demand YoY growth shifts by {coef:+.2f} pp"
-                ),
-            })
-        st.dataframe(
-            pd.DataFrame(coef_rows), use_container_width=True, hide_index=True
-        )
-
-    # --- Correlation bar chart (all indicators) ----------------------------
-    st.subheader("Visual Analysis")
-    st.plotly_chart(
-        _build_correlation_bar(ranking["all_rankings"], ranking["selected_names"]),
-        use_container_width=True,
-    )
-
-    # --- Scatter charts for selected indicators ----------------------------
-    n_sel = len(ranking["selected"])
-    if n_sel > 0:
-        scatter_cols = st.columns(min(n_sel, 3))
-        for col, item in zip(scatter_cols, ranking["selected"]):
-            with col:
-                st.plotly_chart(
-                    _scatter_chart(merged, item["name"], item["label"]),
-                    use_container_width=True,
+        # --- Agent Insight (cross-segment) -----------------------------------
+        insight_parts = []
+        for seg in _seg_rank["segments"]:
+            seg_r = _seg_rank["segment_rankings"][seg]
+            if seg_r["selected"]:
+                top = seg_r["selected"][0]
+                insight_parts.append(
+                    f"**{seg}** is driven by **{top['label']}** (r = {top['corr']:+.3f})"
                 )
+        if insight_parts:
+            st.info(
+                "**Agent Insight — Segment Differentiation:**  \n"
+                + "  \n".join(f"- {p}" for p in insight_parts)
+                + "\n\nDifferent market segments respond to different macro forces. "
+                "The forecast model exploits these distinct relationships."
+            )
+
+        # --- Segment correlation grouped bar chart ----------------------------
+        st.subheader("Visual Analysis — Correlations by Segment")
+        st.plotly_chart(
+            _build_segment_correlation_chart(_seg_rank),
+            use_container_width=True,
+        )
+
+        # --- Also show the aggregate correlation bar -------------------------
+        with st.expander("View aggregate correlation (total demand, all segments combined)"):
+            st.plotly_chart(
+                _build_correlation_bar(ranking["all_rankings"], ranking["selected_names"]),
+                use_container_width=True,
+            )
+
+    # ===== ORIGINAL (NON-SEGMENT) CORRELATION DISPLAY =======================
+    else:
+        st.success(
+            f"✅ Agent evaluated **{n_fetched} Federal Reserve indicators** and found "
+            f"**{n_ranked}** with sufficient data. "
+            f"The top **{len(ranking['selected'])}** were selected as macro regressors."
+        )
+
+        st.subheader("Agent-Selected Indicators")
+        st.markdown(
+            f"After evaluating {n_ranked} FRED data series, the agent selected the "
+            f"**{len(ranking['selected'])} indicators** with the strongest correlation "
+            f"to your demand growth rate:"
+        )
+
+        sel_cols = st.columns(len(ranking["selected"]))
+        for col, item in zip(sel_cols, ranking["selected"]):
+            col.metric(
+                item["label"],
+                f"{item['corr']:+.3f}",
+                help=f"Pearson r between YoY demand growth and {item['label']}. "
+                     "Computed on detrended data to remove company growth trend.",
+            )
+
+        r2_pct = ranking["r_squared"] * 100
+        selected_labels = " + ".join(s["label"] for s in ranking["selected"])
+        st.metric(
+            f"Joint R² ({selected_labels} → Demand Growth)",
+            f"{r2_pct:.1f}%",
+            help="% of YoY demand growth variance explained by the selected indicators together.",
+        )
+
+        top = ranking["selected"][0] if ranking["selected"] else None
+        if top:
+            direction = "positively" if top["corr"] > 0 else "inversely"
+            st.info(
+                f"**Agent Insight:** The selected indicators together explain approximately "
+                f"**{r2_pct:.1f}%** of your historical demand *growth rate* fluctuations "
+                f"(after removing your company's underlying trend). "
+                f"The strongest signal is **{top['label']}** (r = {top['corr']:+.3f}) — "
+                f"your demand is {direction} correlated with this indicator."
+            )
+
+        with st.expander(f"View full ranking — all {n_ranked} evaluated indicators"):
+            selected_names_set = set(ranking["selected_names"])
+            rank_table = pd.DataFrame([
+                {
+                    "Rank": i + 1,
+                    "Indicator": r["label"],
+                    "Pearson r (YoY)": f"{r['corr']:+.4f}",
+                    "|r|": f"{abs(r['corr']):.4f}",
+                    "Selected": "✅" if r["name"] in selected_names_set else "",
+                }
+                for i, r in enumerate(ranking["all_rankings"])
+            ])
+            st.dataframe(rank_table, use_container_width=True, hide_index=True)
+
+        if ranking["coefficients"]:
+            st.subheader("Regression Weights (OLS)")
+            st.caption(
+                "How much does each 1-unit change in a macro indicator shift "
+                "your demand's YoY growth rate (in percentage points)?"
+            )
+            coef_rows = []
+            for item in ranking["selected"]:
+                name = item["name"]
+                coef = ranking["coefficients"].get(name, 0.0)
+                cfg  = FredHelper.SCENARIO_DEFAULTS.get(name, (None, None, None, None, "unit", ""))
+                unit = cfg[4]
+                coef_rows.append({
+                    "Indicator": item["label"],
+                    f"Coefficient (pp demand growth per 1 {unit} change)": f"{coef:+.4f}",
+                    "Interpretation": (
+                        f"1 {unit} {'increase' if coef >= 0 else 'decrease'} in "
+                        f"{item['label']} → demand YoY growth shifts by {coef:+.2f} pp"
+                    ),
+                })
+            st.dataframe(
+                pd.DataFrame(coef_rows), use_container_width=True, hide_index=True
+            )
+
+        st.subheader("Visual Analysis")
+        st.plotly_chart(
+            _build_correlation_bar(ranking["all_rankings"], ranking["selected_names"]),
+            use_container_width=True,
+        )
+
+        n_sel = len(ranking["selected"])
+        if n_sel > 0:
+            scatter_cols = st.columns(min(n_sel, 3))
+            for col, item in zip(scatter_cols, ranking["selected"]):
+                with col:
+                    st.plotly_chart(
+                        _scatter_chart(merged, item["name"], item["label"]),
+                        use_container_width=True,
+                    )
 
 elif (
     st.session_state["company_df"] is None
@@ -651,9 +785,15 @@ if backtest_btn:
             _g_override = st.session_state.get("growth_rate_value")
             _research_sel = st.session_state.get("selected_indicators") or []
 
+            # For segment data, aggregate to total for backtesting
+            if st.session_state["has_segments"] and "segment" in merged.columns:
+                bt_merged = merged.drop(columns=["segment"]).groupby("ds", as_index=False).sum()
+            else:
+                bt_merged = merged
+
             if _run_1y:
                 bt_result, bt_err = _run_backtest(
-                    merged, helper,
+                    bt_merged, helper,
                     horizon=12, n_folds=N_FOLDS,
                     trend_flex=_trend_flex,
                     growth_rate_override=_g_override,
@@ -679,7 +819,7 @@ if backtest_btn:
 
             if _run_5y:
                 bt_result_5y, bt_err_5y = _run_backtest(
-                    merged, helper,
+                    bt_merged, helper,
                     horizon=60, n_folds=N_FOLDS,
                     trend_flex=_trend_flex,
                     growth_rate_override=_g_override,
@@ -761,25 +901,53 @@ if forecast_btn:
     if st.session_state["merged_df"] is None:
         st.error("Please complete the Historical Correlation Research step first.")
     else:
-        with st.spinner("Prophet is training on your macro-augmented data … this may take ~30 seconds."):
+        _has_seg = st.session_state["has_segments"]
+        _spinner_text = (
+            "Prophet is training a model per market segment … this may take ~60 seconds."
+            if _has_seg else
+            "Prophet is training on your macro-augmented data … this may take ~30 seconds."
+        )
+        with st.spinner(_spinner_text):
             try:
                 merged: pd.DataFrame = st.session_state["merged_df"]
                 helper: FredHelper   = st.session_state["fred_helper"]
-                sel_names: list      = st.session_state["selected_indicators"]
                 scenario_vals: dict  = st.session_state.get("scenario_values") or {}
 
-                forecast, model, train_df = run_forecast(
-                    merged=merged,
-                    sel_names=sel_names,
-                    scenario_vals=scenario_vals,
-                    trend_flexibility=st.session_state["trend_flexibility"],
-                    helper=helper,
-                )
-
-                # Persist results
-                st.session_state["forecast_df"] = forecast
-                st.session_state["model"]       = model
-                st.session_state["train_df_for_chart"] = train_df
+                if _has_seg and st.session_state.get("segment_rankings"):
+                    # Segment-aware forecast
+                    combined, seg_results, seg_models = run_segment_forecast(
+                        merged=merged,
+                        segment_rankings=st.session_state["segment_rankings"],
+                        scenario_vals=scenario_vals,
+                        trend_flexibility=st.session_state["trend_flexibility"],
+                        helper=helper,
+                    )
+                    st.session_state["combined_forecast"] = combined
+                    st.session_state["segment_results"]   = seg_results
+                    st.session_state["segment_models"]    = seg_models
+                    st.session_state["forecast_df"]       = combined
+                    st.session_state["model"]             = None
+                    # Build a combined train_df for chart compatibility
+                    all_train = []
+                    for seg, res in seg_results.items():
+                        all_train.append(res["train_df"][["ds", "y"]])
+                    combined_train = pd.concat(all_train).groupby("ds", as_index=False)["y"].sum()
+                    st.session_state["train_df_for_chart"] = combined_train
+                else:
+                    # Original single-model forecast
+                    sel_names: list = st.session_state["selected_indicators"]
+                    forecast, model, train_df = run_forecast(
+                        merged=merged,
+                        sel_names=sel_names,
+                        scenario_vals=scenario_vals,
+                        trend_flexibility=st.session_state["trend_flexibility"],
+                        helper=helper,
+                    )
+                    st.session_state["forecast_df"]       = forecast
+                    st.session_state["model"]             = model
+                    st.session_state["train_df_for_chart"] = train_df
+                    st.session_state["combined_forecast"]  = None
+                    st.session_state["segment_results"]    = None
 
             except Exception as exc:
                 st.error(f"Forecast failed: {exc}")
@@ -795,22 +963,61 @@ if st.session_state.get("forecast_df") is not None:
     train_df: pd.DataFrame = st.session_state.get(
         "train_df_for_chart", st.session_state["merged_df"]
     )
+    _seg_results = st.session_state.get("segment_results")
+    _seg_rank = st.session_state.get("segment_rankings")
 
     st.success("✅ Forecast generated successfully!")
 
-    # --- Main forecast chart ------------------------------------------------
-    st.subheader("Macro-Adjusted Demand Forecast")
+    # --- Segment stacked chart (if segments) --------------------------------
+    if _seg_results and _seg_rank:
+        st.subheader("Combined Forecast — by Market Segment")
+        st.plotly_chart(
+            _build_segment_forecast_chart(
+                forecast, _seg_results, _seg_rank["segments"]
+            ),
+            use_container_width=True,
+        )
+
+        # --- Per-segment detail -----------------------------------------------
+        st.subheader("Per-Segment Forecast Detail")
+        for seg in _seg_rank["segments"]:
+            if seg not in _seg_results:
+                continue
+            seg_res = _seg_results[seg]
+            seg_fc = seg_res["forecast"]
+            seg_train = seg_res["train_df"]
+            seg_future = seg_fc[seg_fc["ds"] > seg_train["ds"].max()]
+            sel_labels = ", ".join(
+                FredHelper.INDICATOR_CATALOGUE[n][1]
+                for n in seg_res["sel_names"]
+                if n in FredHelper.INDICATOR_CATALOGUE
+            )
+            with st.expander(f"**{seg}** — driven by {sel_labels}", expanded=False):
+                st.plotly_chart(
+                    _build_forecast_chart(seg_fc, seg_train),
+                    use_container_width=True,
+                )
+                if len(seg_future) > 0:
+                    seg_total = seg_future["yhat"].sum()
+                    seg_avg = seg_future["yhat"].mean()
+                    c1, c2 = st.columns(2)
+                    c1.metric(f"{seg} — 12-Month Total", f"{seg_total:,.0f}")
+                    c2.metric(f"{seg} — Monthly Average", f"{seg_avg:,.0f}")
+
+    # --- Main forecast chart (combined total) --------------------------------
+    st.subheader("Macro-Adjusted Demand Forecast (Total)")
     st.plotly_chart(
         _build_forecast_chart(forecast, train_df, growth_rate=st.session_state.get("growth_rate_value")),
         use_container_width=True,
     )
 
-    # --- Component chart ----------------------------------------------------
-    st.subheader("Forecast Components")
-    st.plotly_chart(
-        _build_component_chart(forecast, st.session_state.get("selected_indicators") or []),
-        use_container_width=True,
-    )
+    # --- Component chart (only for non-segment mode) -------------------------
+    if not _seg_results:
+        st.subheader("Forecast Components")
+        st.plotly_chart(
+            _build_component_chart(forecast, st.session_state.get("selected_indicators") or []),
+            use_container_width=True,
+        )
 
     # --- Final projected demand ---------------------------------------------
     st.subheader("12-Month Projected Demand Summary")
@@ -839,6 +1046,34 @@ if st.session_state.get("forecast_df") is not None:
         f"{peak_row['yhat']:,.0f} units",
     )
 
+    # --- Per-segment summary table (if segments) ----------------------------
+    if _seg_results and _seg_rank:
+        st.subheader("Forecast by Segment")
+        seg_summary_rows = []
+        for seg in _seg_rank["segments"]:
+            if seg not in _seg_results:
+                continue
+            seg_res = _seg_results[seg]
+            seg_fc = seg_res["forecast"]
+            seg_train = seg_res["train_df"]
+            seg_future = seg_fc[seg_fc["ds"] > seg_train["ds"].max()]
+            seg_total = seg_future["yhat"].sum() if len(seg_future) > 0 else 0
+            seg_pct = (seg_total / total_yhat * 100) if total_yhat else 0
+            sel_labels = ", ".join(
+                FredHelper.INDICATOR_CATALOGUE[n][1].split("(")[0].strip()
+                for n in seg_res["sel_names"]
+                if n in FredHelper.INDICATOR_CATALOGUE
+            )
+            seg_summary_rows.append({
+                "Segment": seg,
+                "12-Month Forecast": f"{seg_total:,.0f}",
+                "% of Total": f"{seg_pct:.1f}%",
+                "Key Macro Drivers": sel_labels,
+            })
+        st.dataframe(
+            pd.DataFrame(seg_summary_rows), use_container_width=True, hide_index=True
+        )
+
     _scenario_str = "  ·  ".join(
         f"{FredHelper.INDICATOR_CATALOGUE[n][1].split('(')[0].strip()} {v:+.2f}"
         for n, v in (st.session_state.get("scenario_values") or {}).items()
@@ -851,7 +1086,15 @@ if st.session_state.get("forecast_df") is not None:
 
     # --- Download button ----------------------------------------------------
     dl_df = future_only[["ds", "yhat", "yhat_lower", "yhat_upper"]].copy()
-    dl_df.columns = ["Date", "Forecast_Demand", "Lower_80pct", "Upper_80pct"]
+    dl_cols = {"ds": "Date", "yhat": "Forecast_Demand", "yhat_lower": "Lower_80pct", "yhat_upper": "Upper_80pct"}
+    # Include per-segment columns in download if available
+    if _seg_results and _seg_rank:
+        for seg in _seg_rank["segments"]:
+            col = f"yhat_{seg}"
+            if col in future_only.columns:
+                dl_df[col] = future_only[col]
+                dl_cols[col] = f"Forecast_{seg}"
+    dl_df = dl_df.rename(columns=dl_cols)
     for n, v in (st.session_state.get("scenario_values") or {}).items():
         label = FredHelper.INDICATOR_CATALOGUE[n][1].replace(" ", "_").replace("(", "").replace(")", "").replace("%", "pct")
         dl_df[f"Scenario_{label}"] = v

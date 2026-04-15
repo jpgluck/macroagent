@@ -79,6 +79,10 @@ Session state keys:
 | `scenario_values` | dict | `{indicator_name: float}` — what-if slider values |
 | `forecast_df` | DataFrame | Prophet forecast output |
 | `model` | Prophet | Trained Prophet model |
+| `has_segments` | bool | Whether uploaded CSV has a market segment column |
+| `segment_rankings` | dict | Output of `rank_indicators_by_segment()` — per-segment correlations |
+| `segment_results` | dict | `{segment: {"forecast": df, "train_df": df, "sel_names": list}}` |
+| `combined_forecast` | DataFrame | Summed forecast across all segments |
 
 Key helpers defined at module level (above `main()`):
 - `_validate_company_df` — parses CSV, detects date/demand columns by name substring
@@ -96,6 +100,7 @@ Key helpers defined at module level (above `main()`):
 - `fetch_all_indicators()` — fetches all 10, skips failures silently.
 - `align_all_indicators(company_df, indicators)` — inner-joins company data with all indicators on month-start dates.
 - `rank_indicators(merged_df, top_n=3)` — **core agent logic**: computes Pearson r of each indicator vs. detrended demand (YoY %), ranks by |r|, selects top N, computes joint OLS R² and coefficients.
+- `rank_indicators_by_segment(merged_df, top_n=3)` — runs `rank_indicators` independently per market segment; returns `{segment_rankings, all_selected_names, segments}`.
 - `prepare_future_regressors(future_df, scenario_values)` — injects what-if values into Prophet future DataFrame.
 
 ## User Workflow (reflected in UI sections)
@@ -110,6 +115,15 @@ Key helpers defined at module level (above `main()`):
 ## Input CSV Format
 
 Must have a date column (name contains `"date"`) and a value column (name contains `"demand"` or `"revenue"`, or exactly `"y"`). Minimum 12 rows, all values positive. Year-only integers (e.g. `2003`) are supported — parsed via `.astype(str)`. See `data/sample_demand.csv` for a working example.
+
+### Market Segment Support
+
+Optionally include a column whose name contains `"segment"` or `"market"` (e.g., `market_segment`). When present:
+- Each segment gets its own correlation analysis against FRED indicators
+- Each segment trains its own Prophet model with its best-correlated indicators
+- Per-segment forecasts are summed into a combined total forecast
+- UI shows per-segment breakdowns, a stacked segment chart, and a summary table
+- If no segment column is found, the app works exactly as before (single-model mode)
 
 ## Debugging Rules
 - When a runtime error occurs, search the codebase for related configuration files before proposing fixes

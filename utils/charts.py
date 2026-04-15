@@ -226,6 +226,197 @@ def _build_backtest_chart(results_df: pd.DataFrame, train_df: pd.DataFrame) -> g
     return fig
 
 
+def _build_segment_forecast_chart(
+    combined_forecast: pd.DataFrame,
+    segment_results: dict,
+    segments: list,
+) -> go.Figure:
+    """
+    Stacked area chart showing per-segment forecast contributions,
+    with the combined total overlaid as a line.
+
+    Parameters
+    ----------
+    combined_forecast : pd.DataFrame
+        Output of run_segment_forecast() — must contain ds, yhat, and
+        per-segment yhat_{seg} columns.
+    segment_results : dict
+        {segment: {"forecast": df, "train_df": df, "sel_names": list}}
+    segments : list
+        Ordered list of segment names (from segment_rankings["segments"]).
+    """
+    SEGMENT_COLORS = [
+        "#1E88E5",  # blue
+        "#43A047",  # green
+        "#FB8C00",  # orange
+        "#E53935",  # red
+        "#8E24AA",  # purple
+        "#00ACC1",  # cyan
+    ]
+
+    fig = go.Figure()
+
+    # Stacked area — one trace per segment using their individual yhats
+    for i, seg in enumerate(segments):
+        col = f"yhat_{seg}"
+        if col not in combined_forecast.columns:
+            continue
+        color = SEGMENT_COLORS[i % len(SEGMENT_COLORS)]
+        fig.add_trace(go.Scatter(
+            x=combined_forecast["ds"],
+            y=combined_forecast[col],
+            mode="lines",
+            stackgroup="segments",
+            name=seg,
+            line=dict(color=color, width=0),
+            fillcolor=color.replace("#", "rgba(").replace(
+                "rgba(", "rgba("
+            ) if False else color,  # plotly handles fill colour from line colour for stackgroup
+        ))
+
+    # Total forecast line on top
+    fig.add_trace(go.Scatter(
+        x=combined_forecast["ds"],
+        y=combined_forecast["yhat"],
+        mode="lines",
+        name="Total Forecast",
+        line=dict(color="#212121", width=2.5),
+    ))
+
+    # Historical actuals (summed across segments using train_dfs)
+    hist_frames = []
+    for seg, res in segment_results.items():
+        hist_frames.append(res["train_df"][["ds", "y"]])
+    if hist_frames:
+        hist = (
+            pd.concat(hist_frames)
+            .groupby("ds", as_index=False)["y"]
+            .sum()
+            .sort_values("ds")
+        )
+        fig.add_trace(go.Scatter(
+            x=hist["ds"],
+            y=hist["y"],
+            mode="markers+lines",
+            name="Historical (Total)",
+            line=dict(color="#616161", width=1.5, dash="dot"),
+            marker=dict(size=5, color="#616161"),
+        ))
+
+    # Vertical line at forecast start
+    if hist_frames:
+        cutoff_str = hist["ds"].max().isoformat()
+        fig.add_shape(
+            type="line",
+            x0=cutoff_str, x1=cutoff_str,
+            y0=0, y1=1,
+            xref="x", yref="paper",
+            line=dict(width=1.5, dash="dash", color="#E53935"),
+        )
+        fig.add_annotation(
+            x=cutoff_str, y=1,
+            xref="x", yref="paper",
+            text="Forecast Start",
+            showarrow=False,
+            xanchor="right",
+            yanchor="top",
+            font=dict(color="#E53935"),
+        )
+
+    fig.update_layout(
+        title="12-Month Segment Forecast (Stacked by Market Segment)",
+        xaxis_title="Date",
+        yaxis_title="Demand",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        template="plotly_white",
+        height=500,
+    )
+    return fig
+
+
+def _build_segment_correlation_chart(segment_rankings: dict) -> go.Figure:
+    """
+    Grouped bar chart showing, for each evaluated indicator,
+    its Pearson correlation with demand growth broken out by segment.
+
+    This makes it easy to see, e.g., that GDP correlates strongly with
+    Commercial demand but weakly with Residential demand.
+
+    Parameters
+    ----------
+    segment_rankings : dict
+        Output of rank_indicators_by_segment().
+    """
+    segments = segment_rankings["segments"]
+    # Collect all indicator names that appear in any segment's ranking
+    all_indicator_names: list = []
+    seen: set = set()
+    for seg in segments:
+        for entry in segment_rankings["segment_rankings"][seg]["all_rankings"]:
+            if entry["name"] not in seen:
+                all_indicator_names.append(entry["name"])
+                seen.add(entry["name"])
+
+    # Build a lookup: {seg: {name: corr}}
+    corr_lookup: dict = {}
+    for seg in segments:
+        corr_lookup[seg] = {
+            e["name"]: e["corr"]
+            for e in segment_rankings["segment_rankings"][seg]["all_rankings"]
+        }
+
+    # Collect labels in indicator order
+    # Use the label from the first segment that has the indicator
+    label_map: dict = {}
+    for seg in segments:
+        for e in segment_rankings["segment_rankings"][seg]["all_rankings"]:
+            if e["name"] not in label_map:
+                label_map[e["name"]] = e["label"]
+
+    x_labels = [label_map.get(n, n) for n in all_indicator_names]
+
+    SEGMENT_COLORS = [
+        "#1E88E5",
+        "#43A047",
+        "#FB8C00",
+        "#E53935",
+        "#8E24AA",
+        "#00ACC1",
+    ]
+
+    fig = go.Figure()
+    for i, seg in enumerate(segments):
+        color = SEGMENT_COLORS[i % len(SEGMENT_COLORS)]
+        y_vals = [corr_lookup[seg].get(name, 0.0) for name in all_indicator_names]
+        fig.add_trace(go.Bar(
+            name=seg,
+            x=x_labels,
+            y=y_vals,
+            marker_color=color,
+            text=[f"{v:+.3f}" for v in y_vals],
+            textposition="outside",
+        ))
+
+    fig.add_hline(y=0, line_width=1, line_color="#888")
+    fig.update_layout(
+        title=(
+            "Indicator Correlations with Demand Growth — by Market Segment<br>"
+            "<sup>Grouped bars show how each macro indicator relates differently to each segment</sup>"
+        ),
+        barmode="group",
+        yaxis_title="Pearson r",
+        yaxis=dict(range=[-1.15, 1.15], tickformat=".2f"),
+        xaxis_title=None,
+        xaxis_tickangle=-30,
+        template="plotly_white",
+        height=460,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(b=120),
+    )
+    return fig
+
+
 def _scatter_chart(merged_df: pd.DataFrame, x_col: str, x_label: str) -> go.Figure:
     """Scatter of YoY demand growth rate vs. a macro indicator with an OLS trend line.
     Uses detrended demand (YoY % change) so startup-style growth doesn't produce

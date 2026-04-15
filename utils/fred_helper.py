@@ -257,6 +257,33 @@ class FredHelper:
             "coefficients":   coefficients,
         }
 
+    def rank_indicators_by_segment(self, merged_df: pd.DataFrame, top_n: int = 3) -> dict:
+        """
+        Rank indicators independently for each market segment.
+
+        Returns dict with keys:
+          segment_rankings   — {segment_name: rank_indicators() result}
+          all_selected_names — sorted list of all unique indicator names selected across segments
+          segments           — list of segment names
+        """
+        segments = sorted(merged_df["segment"].unique())
+        segment_rankings = {}
+        all_selected: set = set()
+
+        for seg in segments:
+            seg_df = merged_df[merged_df["segment"] == seg].copy()
+            # Drop segment column before ranking since rank_indicators doesn't expect it
+            seg_df = seg_df.drop(columns=["segment"])
+            ranking = self.rank_indicators(seg_df, top_n=top_n)
+            segment_rankings[seg] = ranking
+            all_selected.update(ranking["selected_names"])
+
+        return {
+            "segment_rankings":   segment_rankings,
+            "all_selected_names": sorted(all_selected),
+            "segments":           segments,
+        }
+
     # ------------------------------------------------------------------
     # Future regressor injection (generic)
     # ------------------------------------------------------------------
